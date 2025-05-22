@@ -202,6 +202,15 @@ private[sql] object OrcFilters extends OrcFiltersBase {
         val rhs = buildSearchArgument(dataTypeMap, right, lhs)
         rhs.end()
 
+      case Not(EqualNullSafe(name, value)) if dataTypeMap.contains(name) =>
+        if (value == null) {
+          // Not(EqualNullSafe(attribute, null)) means attribute IS NOT NULL
+          builder.startNot().isNull(dataTypeMap(name).fieldName, getPredicateLeafType(dataTypeMap(name).fieldType)).end()
+        } else {
+          val castedValue = castLiteralValue(value, dataTypeMap(name).fieldType)
+          builder.startNot().nullSafeEquals(dataTypeMap(name).fieldName, getPredicateLeafType(dataTypeMap(name).fieldType), castedValue).end()
+        }
+
       case Not(child) =>
         buildSearchArgument(dataTypeMap, child, builder.startNot()).end()
 
@@ -225,8 +234,9 @@ private[sql] object OrcFilters extends OrcFiltersBase {
       dataTypeMap: Map[String, OrcPrimitiveField],
       expression: Filter,
       builder: Builder): Option[Builder] = {
-    def getType(attribute: String): PredicateLeaf.Type =
+    def getType(attribute: String): PredicateLeaf.Type = {
       getPredicateLeafType(dataTypeMap(attribute).fieldType)
+    }
 
     import org.apache.spark.sql.sources._
 
@@ -240,9 +250,15 @@ private[sql] object OrcFilters extends OrcFiltersBase {
           .equals(dataTypeMap(name).fieldName, getType(name), castedValue).end())
 
       case EqualNullSafe(name, value) if dataTypeMap.contains(name) =>
-        val castedValue = castLiteralValue(value, dataTypeMap(name).fieldType)
-        Some(builder.startAnd()
-          .nullSafeEquals(dataTypeMap(name).fieldName, getType(name), castedValue).end())
+        if (value == null) {
+          // EqualNullSafe(attribute, null) means attribute IS NULL
+          Some(builder.startAnd()
+            .isNull(dataTypeMap(name).fieldName, getType(name)).end())
+        } else {
+          val castedValue = castLiteralValue(value, dataTypeMap(name).fieldType)
+          Some(builder.startAnd()
+            .nullSafeEquals(dataTypeMap(name).fieldName, getType(name), castedValue).end())
+        }
 
       case LessThan(name, value) if dataTypeMap.contains(name) =>
         val castedValue = castLiteralValue(value, dataTypeMap(name).fieldType)

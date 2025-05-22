@@ -816,5 +816,111 @@ class OrcFilterSuite extends OrcTest with SharedSparkSession {
         .equals("a.cint", OrcFilters.getPredicateLeafType(IntegerType), 2L)
         .`end`().build())
   }
+
+  test("SPARK-52032: OrcFilter pushdown with null-safe equality operator") {
+    val data = Seq(
+      ("abc", 1),
+      (null, 2),
+      ("def", 3),
+      (null, 4),
+      ("abc", 5)
+    ).map { case (s, i) =>
+      (Option(s).orNull, i)
+    }
+
+    withOrcDataFrame(data) { case (inputDF, c1, c2) =>
+      implicit val df: DataFrame = inputDF
+
+      // Test data:
+      // +----+---+
+      // |  c1| c2|
+      // +----+---+
+      // | abc|  1|
+      // |null|  2|
+      // | def|  3|
+      // |null|  4|
+      // | abc|  5|
+      // +----+---+
+
+      // Scenario 1: column <=> NULL
+      val expected1 = data.filter(_._1 == null).map(Row.fromTuple)
+      checkAnswer(df.where(col(c1) <=> Literal(null, StringType)), expected1)
+      checkAnswer(df.where(s"$c1 <=> NULL"), expected1)
+      checkFilterPredicate(df(c1).expr <=> Literal(null, StringType), PredicateLeaf.Operator.IS_NULL)
+
+      // Scenario 2: NOT (column <=> NULL)
+      val expected2 = data.filter(_._1 != null).map(Row.fromTuple)
+      checkAnswer(df.where(!(col(c1) <=> Literal(null, StringType))), expected2)
+      checkAnswer(df.where(s"NOT ($c1 <=> NULL)"), expected2)
+      // NOT (c1 IS NULL) -> c1 IS NOT NULL
+      checkFilterPredicate(! (df(c1).expr <=> Literal(null, StringType)), "leaf-0 = (IS_NULL _1), expr = (not leaf-0)")
+
+
+      // Scenario 3: column <=> non_null_literal
+      val expected3 = data.filter(t => t._1 != null && t._1 == "abc").map(Row.fromTuple)
+      checkAnswer(df.where(col(c1) <=> "abc"), expected3)
+      checkAnswer(df.where(s"$c1 <=> 'abc'"), expected3)
+      checkFilterPredicate(df(c1).expr <=> "abc", PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+
+      // Scenario 4: NOT (column <=> non_null_literal)
+      // This means (c1 IS NULL) OR (c1 != "abc")
+      val expected4 = data.filter(t => t._1 == null || t._1 != "abc").map(Row.fromTuple)
+      checkAnswer(df.where(!(col(c1) <=> "abc")), expected4)
+      checkAnswer(df.where(s"NOT ($c1 <=> 'abc')"), expected4)
+      checkFilterPredicate(! (df(c1).expr <=> "abc"), "leaf-0 = (IS_NULL _1), leaf-1 = (NULL_SAFE_EQUALS _1 abc), expr = (not leaf-1)")
+
+
+      // Scenario 5: literal <=> column (commutative)
+      checkAnswer(df.where(Literal(null, StringType) <=> col(c1)), expected1)
+      checkAnswer(df.where(s"NULL <=> $c1"), expected1)
+      checkFilterPredicate(Literal(null, StringType) <=> df(c1).expr, PredicateLeaf.Operator.IS_NULL)
+
+      // Scenario 6: non_null_literal <=> column (commutative)
+      checkAnswer(df.where("abc" <=> col(c1)), expected3)
+      checkAnswer(df.where(s"'abc' <=> $c1"), expected3)
+      checkFilterPredicate(Literal("abc") <=> df(c1).expr, PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+
+
+      // Integer column tests for good measure
+      val intData = Seq(Row(1), Row(null), Row(2), Row(null), Row(1))
+      withOrcDataFrame(intData.map(r => Tuple1.apply(Option(r.get(0)).map(_.asInstanceOf[Int])))) {
+        case (intDf, intCol, _) =>
+          implicit val dfInt: DataFrame = intDf
+          // +-------+
+          // |intCol |
+          // +-------+
+          // |    1  |
+          // |  null |
+          // |    2  |
+          // |  null |
+          // |    1  |
+          // +-------+
+
+          // Scenario 1i: column <=> NULL
+          val expected1i = intData.filter(_.get(0) == null)
+          checkAnswer(dfInt.where(col(intCol) <=> Literal(null, IntegerType)), expected1i)
+          checkAnswer(dfInt.where(s"$intCol <=> NULL"), expected1i)
+          checkFilterPredicate(dfInt(intCol).expr <=> Literal(null, IntegerType), PredicateLeaf.Operator.IS_NULL)(dfInt)
+
+          // Scenario 2i: NOT (column <=> NULL)
+          val expected2i = intData.filter(_.get(0) != null)
+          checkAnswer(dfInt.where(!(col(intCol) <=> Literal(null, IntegerType))), expected2i)
+          checkAnswer(dfInt.where(s"NOT ($intCol <=> NULL)"), expected2i)
+          checkFilterPredicate(! (dfInt(intCol).expr <=> Literal(null, IntegerType)), "leaf-0 = (IS_NULL _1), expr = (not leaf-0)")(dfInt)
+
+          // Scenario 3i: column <=> non_null_literal
+          val expected3i = intData.filter(r => r.get(0) != null && r.getAs[Int](0) == 1)
+          checkAnswer(dfInt.where(col(intCol) <=> 1), expected3i)
+          checkAnswer(dfInt.where(s"$intCol <=> 1"), expected3i)
+          checkFilterPredicate(dfInt(intCol).expr <=> 1, PredicateLeaf.Operator.NULL_SAFE_EQUALS)(dfInt)
+
+          // Scenario 4i: NOT (column <=> non_null_literal)
+          val expected4i = intData.filter(r => r.get(0) == null || r.getAs[Int](0) != 1)
+          checkAnswer(dfInt.where(!(col(intCol) <=> 1)), expected4i)
+          checkAnswer(dfInt.where(s"NOT ($intCol <=> 1)"), expected4i)
+          checkFilterPredicate(! (dfInt(intCol).expr <=> 1), "leaf-0 = (IS_NULL _1), leaf-1 = (NULL_SAFE_EQUALS _1 1), expr = (not leaf-1)")(dfInt)
+      }
+    }
+  }
 }
 
